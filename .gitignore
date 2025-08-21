@@ -10,3 +10,9 @@ Deep-EIoU/outputs/
 *.pt
 Deep-EIoU/reid/build/
 Deep-EIoU/reid/torchreid.egg-info/
+.venv/
+Deep-EIoU/YOLOX_outputs/
+Deep-EIoU/outputs/
+*.pt
+Deep-EIoU/reid/build/
+Deep-EIoU/reid/torchreid.egg-info/
