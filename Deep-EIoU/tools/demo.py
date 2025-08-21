@@ -2,6 +2,10 @@ import argparse
 import os
 import os.path as osp
 import numpy as np
+# NumPy shim for deprecated aliases (compat with code using np.float, etc.)
+for _n, _v in [("float", float), ("int", int), ("bool", bool), ("object", object), ("complex", complex)]:
+    if not hasattr(np, _n):
+        setattr(np, _n, _v)
 import time
 import cv2
 import torch
@@ -19,6 +23,7 @@ from yolox.tracking_utils.timer import Timer
 from tracker.Deep_EIoU import Deep_EIoU
 from reid.torchreid.utils import FeatureExtractor
 import torchvision.transforms as T
+from detectors.external_mot import ExternalMOTDetections
 
 
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
@@ -57,6 +62,9 @@ def make_parser():
     parser.add_argument("--nms", default=None, type=float, help="test nms threshold")
     parser.add_argument("--tsize", default=None, type=int, help="test img size")
     parser.add_argument("--fps", default=30, type=int, help="frame rate (fps)")
+    parser.add_argument("--mot_dets", type=str, default='', help='Path to MOT det file (xywh). If set, bypass YOLOX and use external detections.')
+    parser.add_argument("--max_frames", type=int, default=0, help="If >0, stop after this many frames.")
+    parser.add_argument("--debug_echo_dets", action="store_true", help="Write each detection as a 1-frame track (no association) for debugging.")
     parser.add_argument(
         "--fp16",
         dest="fp16",
@@ -196,22 +204,68 @@ def imageflow_demo(predictor, extractor, vis_folder, current_time, args):
     timer = Timer()
     frame_id = 0
     results = []
+    # Optional external detections
+    use_external = bool(args.mot_dets)
+    if use_external:
+        ext = ExternalMOTDetections(args.mot_dets)
+
     while True:
         if frame_id % 30 == 0:
             logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
         ret_val, frame = cap.read()
         if ret_val:
-            outputs, img_info = predictor.inference(frame, timer)
-            if outputs[0] is not None:
-                det = outputs[0].cpu().detach().numpy()
-                scale = min(1440/width, 800/height)
-                det /= scale
-                rows_to_remove = np.any(det[:, 0:4] < 1, axis=1) # remove edge detection
-                det = det[~rows_to_remove]
+            fid1 = frame_id + 1  # 1-based frame index for external dets and output
+            if use_external:
+                # Build det array in Deep-EIoU expected format: x1,y1,x2,y2,score,?,?
+                dets = ext.get(fid1)
+                # If no detections, proceed with empty arrays
+                if dets.shape[0] == 0:
+                    det = np.zeros((0, 7), dtype=np.float32)
+                    img_info = {"raw_img": frame}
+                else:
+                    # Match original det shape [x1,y1,x2,y2,score,cls,?]
+                    pad = np.zeros((dets.shape[0], 2), dtype=np.float32)
+                    pad[:, 0] = 1.0  # class id = 1 (person)
+                    det = np.concatenate([dets, pad], axis=1)
+                    img_info = {"raw_img": frame}
+            else:
+                outputs, img_info = predictor.inference(frame, timer)
+                if outputs[0] is not None:
+                    det = outputs[0].cpu().detach().numpy()
+                    scale = min(1440/width, 800/height)
+                    det /= scale
+                    rows_to_remove = np.any(det[:, 0:4] < 1, axis=1) # remove edge detection
+                    det = det[~rows_to_remove]
+                else:
+                    det = np.zeros((0, 7), dtype=np.float32)
+
+            if fid1 % 25 == 0:
+                try:
+                    print(f"[Deep-EIoU] frame={fid1} dets={det.shape[0] if isinstance(det, np.ndarray) else 0}")
+                except Exception:
+                    pass
+
+            if args.debug_echo_dets and det.shape[0] > 0:
+                for i, (x1, y1, x2, y2, score, _, _) in enumerate(det):
+                    w = max(0.0, x2 - x1)
+                    h = max(0.0, y2 - y1)
+                    results.append(f"{fid1},{100000+i},{x1:.2f},{y1:.2f},{w:.2f},{h:.2f},{float(score):.2f},-1,-1,-1\n")
+                if args.save_result:
+                    vid_writer.write(img_info['raw_img'])
+                frame_id += 1
+                if args.max_frames and (frame_id) >= args.max_frames:
+                    break
+                continue
+
+            if det.shape[0] > 0:
                 cropped_imgs = [frame[max(0,int(y1)):min(height,int(y2)),max(0,int(x1)):min(width,int(x2))] for x1,y1,x2,y2,_,_,_ in det]
                 embs = extractor(cropped_imgs)
                 embs = embs.cpu().detach().numpy()
                 online_targets = tracker.update(det, embs)
+                try:
+                    print(f"[Deep-EIoU] frame={fid1} tracks={len(online_targets)}")
+                except Exception:
+                    pass
                 online_tlwhs = []
                 online_ids = []
                 online_scores = []
@@ -223,11 +277,11 @@ def imageflow_demo(predictor, extractor, vis_folder, current_time, args):
                         online_ids.append(tid)
                         online_scores.append(t.score)
                         results.append(
-                            f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
+                            f"{fid1},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
                         )
                 timer.toc()
                 online_im = plot_tracking(
-                    img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id + 1, fps=1. / timer.average_time
+                    img_info['raw_img'], online_tlwhs, online_ids, frame_id=fid1, fps=1. / timer.average_time
                 )
             else:
                 timer.toc()
@@ -240,13 +294,125 @@ def imageflow_demo(predictor, extractor, vis_folder, current_time, args):
         else:
             break
         frame_id += 1
+        if args.max_frames and (frame_id) >= args.max_frames:
+            break
 
+    if args.save_result:
+        res_file = osp.join(vis_folder, f"{timestamp}.txt")
+        with open(res_file, 'w') as f:
+            # Ensure first column is 1-based frame index
+            f.writelines(results)
+        logger.info(f"save results to {res_file}")
+
+
+def imagefolder_demo(predictor, extractor, vis_folder, current_time, args):
+    image_paths = sorted(get_image_list(args.path))
+    if not image_paths:
+        logger.warning(f"No images found under {args.path}")
+        return
+    probe = cv2.imread(image_paths[0])
+    height, width = probe.shape[:2]
+    fps = args.fps if hasattr(args, 'fps') else 25
+    timestamp = time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
+    save_folder = osp.join(vis_folder, timestamp)
+    os.makedirs(save_folder, exist_ok=True)
+    save_path = osp.join(save_folder, "frames.mp4")
+    logger.info(f"video save_path is {save_path}")
+    vid_writer = cv2.VideoWriter(
+        save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (int(width), int(height))
+    )
+    tracker = Deep_EIoU(args, frame_rate=fps)
+    timer = Timer()
+    results = []
+
+    # Optional external detections
+    use_external = bool(args.mot_dets)
+    if use_external:
+        ext = ExternalMOTDetections(args.mot_dets)
+
+    for frame_id, path in enumerate(image_paths, start=0):
+        if frame_id % 30 == 0:
+            logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
+        frame = cv2.imread(path)
+        if frame is None:
+            continue
+
+        fid1 = frame_id + 1  # 1-based index
+        if use_external:
+            dets = ext.get(fid1)
+            if dets.shape[0] == 0:
+                det = np.zeros((0, 7), dtype=np.float32)
+                img_info = {"raw_img": frame}
+            else:
+                pad = np.zeros((dets.shape[0], 2), dtype=np.float32)
+                pad[:, 0] = 1.0  # class id = 1 (person)
+                det = np.concatenate([dets, pad], axis=1)
+                img_info = {"raw_img": frame}
+        else:
+            outputs, img_info = predictor.inference(frame, timer)
+            if outputs[0] is not None:
+                det = outputs[0].cpu().detach().numpy()
+                scale = min(1440/width, 800/height)
+                det /= scale
+                rows_to_remove = np.any(det[:, 0:4] < 1, axis=1)
+                det = det[~rows_to_remove]
+            else:
+                det = np.zeros((0, 7), dtype=np.float32)
+
+        if fid1 % 25 == 0:
+            try:
+                print(f"[Deep-EIoU] frame={fid1} dets={det.shape[0] if isinstance(det, np.ndarray) else 0}")
+            except Exception:
+                pass
+
+        if args.debug_echo_dets and det.shape[0] > 0:
+            for i, (x1, y1, x2, y2, score, _, _) in enumerate(det):
+                w = max(0.0, x2 - x1)
+                h = max(0.0, y2 - y1)
+                results.append(f"{fid1},{100000+i},{x1:.2f},{y1:.2f},{w:.2f},{h:.2f},{float(score):.2f},-1,-1,-1\n")
+            if args.save_result:
+                vid_writer.write(frame)
+            if args.max_frames and (frame_id + 1) >= args.max_frames:
+                break
+            continue
+
+        if det.shape[0] > 0:
+            cropped_imgs = [frame[max(0,int(y1)):min(height,int(y2)),max(0,int(x1)):min(width,int(x2))] for x1,y1,x2,y2,_,_,_ in det]
+            embs = extractor(cropped_imgs)
+            embs = embs.cpu().detach().numpy()
+            online_targets = tracker.update(det, embs)
+            try:
+                print(f"[Deep-EIoU] frame={fid1} tracks={len(online_targets)}")
+            except Exception:
+                pass
+            online_tlwhs = []
+            online_ids = []
+            online_scores = []
+            for t in online_targets:
+                tlwh = t.last_tlwh
+                tid = t.track_id
+                if tlwh[2] * tlwh[3] > args.min_box_area:
+                    online_tlwhs.append(tlwh)
+                    online_ids.append(tid)
+                    online_scores.append(t.score)
+                    results.append(
+                        f"{fid1},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
+                    )
+            timer.toc()
+            online_im = img_info['raw_img']
+        else:
+            timer.toc()
+            online_im = frame
+
+        if args.save_result:
+            vid_writer.write(online_im)
+        if args.max_frames and (frame_id + 1) >= args.max_frames:
+            break
     if args.save_result:
         res_file = osp.join(vis_folder, f"{timestamp}.txt")
         with open(res_file, 'w') as f:
             f.writelines(results)
         logger.info(f"save results to {res_file}")
-
 
 def main(exp, args):
     if not args.experiment_name:
@@ -275,14 +441,15 @@ def main(exp, args):
     logger.info("Model Summary: {}".format(get_model_info(model, exp.test_size)))
     model.eval()
 
-    if not args.trt:
+    # If external detections are provided, skip loading YOLOX weights
+    use_external = bool(getattr(args, 'mot_dets', ''))
+    if (not args.trt) and (not use_external):
         if args.ckpt is None:
             ckpt_file = "checkpoints/best_ckpt.pth.tar"
         else:
             ckpt_file = args.ckpt
         logger.info("loading checkpoint")
         ckpt = torch.load(ckpt_file, map_location="cpu")
-        # load the model state dict
         model.load_state_dict(ckpt["model"])
         logger.info("loaded checkpoint done.")
 
@@ -311,11 +478,15 @@ def main(exp, args):
     
     extractor = FeatureExtractor(
         model_name='osnet_x1_0',
-        model_path = 'checkpoints/sports_model.pth.tar-60',
-        device='cuda'
-    )   
+        model_path='checkpoints/sports_model.pth.tar-60',
+        device='cpu'
+    )
 
-    imageflow_demo(predictor, extractor, vis_folder, current_time, args)
+    # Choose folder or video path
+    if os.path.isdir(args.path):
+        imagefolder_demo(predictor, extractor, vis_folder, current_time, args)
+    else:
+        imageflow_demo(predictor, extractor, vis_folder, current_time, args)
 
 
 if __name__ == "__main__":
